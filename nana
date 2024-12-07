@@ -1,0 +1,555 @@
+#!/usr/bin/bash
+
+
+# GRANT THE MOTHERLAND WHAT IS OURS
+# AND FANCY THE FALLEN COURTS
+# TO DEATH
+# OUR SORROW LASTS 'TIL TODAY!
+
+# USE SNAKE CASE KTHX
+
+set -eu
+
+# The latest full backup (link name)
+declare -r LATEST_FULL="latest_full"
+# The latest backup (link name)
+declare -r LATEST="latest"
+# The database storing metainformation
+declare -r DB="nana.db"
+# The database command to use
+declare -r SQL="sqlite3"
+
+# Echo to stderr
+error() {
+    echo "$1" >&2
+}
+
+# Error out and exit with error
+die() {
+    error "${1:-Terminated}"
+    exit 1
+}
+
+# Run the prune command.
+# This command will trim the total size of the backed up files (excluding the DB
+# and other housekeeping files) to the requested size.
+# 1 -> the directory containing the backups (and db)
+# 2 -> the target size in bytes, with an optional suffix (K, M, G) using powers
+#   of 1024 (KiB, MiB, GiB, etc)
+cmd_prune() {
+    #Warning: This function is a #*$)@ mess
+    [[ $# -ne 2 ]] && die "Expected exactly two arguments"
+
+    local target="$1"
+    local max_size="$2"
+
+    [[ ! -d "$target" ]] && die "Target is not a directory"
+    [[ ! "$max_size" =~ ^[1-9][0-9]*[GgMmKk]?$ ]] && die "Invalid size specification"
+
+    
+    # From the bash man page:
+    # "Note that a negative offset must be separated from the colon by at
+    # least one space to avoid being confused with the :- expansion."
+    # Wicked
+    if [[ "${#max_size}" -gt 1 ]]; then
+        local spec="${max_size: -1:1}"
+        local orig_max_size=$max_size
+        max_size="${max_size:0:$((${#max_size} - 1))}"
+
+        # Convert size + specifyer to actual bytes
+        case "$spec" in
+            g|G)   max_size=$((max_size * 1024 * 1024 * 1024));;
+            m|M)   max_size=$((max_size * 1024 * 1024));;
+            k|K)   max_size=$((max_size * 1024));;
+            [0-9]) max_size=$orig_max_size ;;
+            *) die "Unexpected size spec $spec"
+        esac
+    fi
+
+    if [[ ! "$max_size" =~ ^[0-9]+$ ]]; then
+        die "size must be an integer"
+    fi
+
+    cd "$target"
+
+    local -r db="$(readlink -f "$DB")"
+
+
+    # THIS DOESN"T WORK AAAAAAAAAAAAAAAAAAAAAAAAAa
+    # set $(ls -r --sort=time --time=mtime)
+    # Figured it out
+    # ty stack
+    # https://stackoverflow.com/a/39598334
+    local -a listing
+    # Effective sizes for each directory (that is, how much space will be freed
+    # by their deletion), sorted by date
+    readarray -t listing < <("$SQL" "$db" "select basename,size from items order by date;")
+
+    # The total size of the backup
+    local size=$("$SQL" "$db" "select value from int_prop where key='size';")
+    echo "Current size is $size"
+    local delta=$((size - max_size))
+
+    if [[ $delta -le 0 ]]; then
+        echo "Storage within constraints, doing nothing..."
+        return 0
+    fi
+
+    # What we want to delete
+    local -a staging
+
+    # Starting from the oldest entry, delete until we have freed enough space to
+    # put us in the green
+    for e in "${listing[@]}"; do
+        local -a entry
+        readarray -t -d '|' entry <<<"$e"
+        local entry_name="${entry[0]}"
+        local entry_size="${entry[1]}"
+        delta=$((delta - entry_size))
+        staging+=("$entry_name")
+        [[ $delta -le 0 ]] && break
+    done
+
+    # Confirm deletion with user
+    echo "Continuing will delete the following folders:"
+    printf "%s\n" "${staging[@]}"
+    printf "Continue? [y/N]"
+    local response
+    read -r response
+    if [[ "$response" =~ ^[yY]$ ]]; then
+        echo "Removing files..."
+        # local script=""
+        local rem_size=0
+        for f in "${staging[@]}"; do
+            echo "Removing $f"
+            # TODO: Batching
+            local fsize="$("$SQL" "$db" "select size from items where basename='$f';")"
+            rem_size=$((rem_size + fsize))
+            # "$SQL" "$db" "update int_prop set value=value-$fsize where key='size';"
+            # "$SQL" "$db" "delete from items where basename='$f';"
+            # "$SQL" "$db" "delete from inodes where directory='$f';"
+            # script="$script update int_prop set value=value-$fsize where key='size';"
+            # script="$script delete from items where basename='$f';"
+            # script="$script delete from inodes where directory='$f';"
+            rm -rf "$f"
+        done
+        # "$SQL" "$db" <<<"$script"
+        "$SQL" "$db" "update int_prop set value=value-$rem_size where key='size';"
+
+        # Remove dead links
+        if [[ ! -d "$(readlink -f "$LATEST_FULL")" ]]; then
+            rm "$LATEST_FULL"
+        fi
+        if [[ ! -d "$(readlink -f "$LATEST")" ]]; then
+            rm "$LATEST"
+            # Oh wow, this means everything got removed... Huh.
+        fi
+    else
+        echo "Nothing was done."
+    fi
+
+}
+
+# The pride of the fleet (though not really).
+# Run a backup.
+# Performs caching to $DB
+# cmd_run [options] <source> <dest_dir>
+# -a|--action <spec>            The action to perform (full, inc, diff) (default: inc)
+# -e|--exclude-file <path>      File containing patters to exclude
+# -f|--format <fmt>             `date` format for naming backups
+# -c|--compress                 Create a tarball instead of copying to a directory
+# -k|--key <key>                If --compress, encrypt with this GPG key
+# -h|--hash                     When doing incremental or differential, compare checksums
+#                               instead of metadata.
+cmd_run() {
+    local action=inc
+    local format="%F_%H-%M-%S"
+    local check_hash=0
+    local compress=0
+    local exclude_file=
+    local key=
+    local from=
+    local to=
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--action)       shift; action="$1";;
+            -e|--exclude-file) shift; exclude_file="$1";;
+            -f|--format)       shift; format="$1";;
+            -k|--key)          shift; key="$1";;
+            -h|--hash)                check_hash=1;;
+            -c|--compress)            compress=1;;
+            *)
+                [[ $# -ne 2 ]] && die "Invalid number of positional arguments"
+                from="$1"
+                to="$2"
+                shift
+                ;;
+        esac
+        shift
+    done
+    from="$(readlink -f "$from")"
+    to="$(readlink -f "$to")"
+    [[ ! -d "$from" ]] && die "Source is not a regular directory"
+    [[ ! -d "$to" ]] && die "Destination is not a regular directory"
+
+    # VERY IMPORTANT
+    cd "$to"
+
+    local staging="staging"
+
+    echo "Removing staging..."
+    rm -rf "$staging"
+    mkdir "$staging"
+    echo "Done removing staging"
+
+    local real_db="$(readlink -f "$DB")"
+    local db="$(readlink -f "$staging/database.db")"
+
+    if [[ ! -f "$real_db" ]]; then
+        # TODO: Write a db_repair function
+        "$SQL" "$real_db" "$(cat <<HERE
+        create table int_prop (
+            key text not null primary key,
+            value integer not null
+        );
+        create table items (
+            basename text not null primary key,
+            size integer not null,
+            date integer not null
+        );
+        insert into int_prop values ('size', 0);
+HERE
+)"
+    fi
+
+    cp "$real_db" "$db"
+
+    local dest="$(readlink -f "$staging/$(date +"$format")")"
+    # We will want this later
+    local previous="$(readlink -f "$LATEST")"
+
+    if [[ $compress -eq 1 ]]; then
+        dest="$dest.tar.gz"
+        # This is so, so... What am I doing... What is this...
+        local pipe_cmd=cat
+        local pipe_opts=()
+        local args=(-c -v)
+        if [[ -n "$key" ]]; then
+            pipe_cmd=gpg
+            pipe_opts=(--encrypt -r "$key")
+            dest="$dest.gpg"
+        fi
+        [[ -n "$exclude_file" ]] && args+=(-X "$exclude_file")
+        tar "${args[@]}" "$from" | $pipe_cmd "${pipe_opts[@]}" > "$dest"
+    else
+
+        local args=(--archive --links --safe-links --verbose --info=SKIP2)
+        # local -r ln_args=-svfT
+
+        [[ -n "$exclude_file" ]] && args+=(--exclude-from="$exclude_file")
+        [[ $check_hash -eq 1 ]] && args+=(--checksum)
+
+
+        if [[ $action == full ]]; then
+            link_target="$LATEST_FULL"
+        elif [[ $action == diff ]]; then
+            [[ ! -L "$LATEST_FULL" ]] && die "Need at least one full backup for differential backups"
+            # This should be a variable
+            args+=(--link-dest="$to/$LATEST_FULL")
+            previous="$(readlink -f "$LATEST_FULL")"
+        elif [[ $action == inc ]]; then
+            [[ ! -L "$LATEST" ]] && die "Need at least one backup for incremental backups"
+            args+=(--link-dest="$to/$LATEST")
+        else
+            die "Invalid action $action"
+        fi
+        mkdir "$dest"
+        echo ">> rsync ${args[@]} $from $dest"
+        local code=0
+        rsync "${args[@]}" "$from/" "$dest/" || code=$?
+        if [[ $code -ne 0 ]]; then
+            die "rsync exited with errors..."
+        fi
+
+        # ln $ln_args "$dest" "$LATEST"
+        # [[ $action == full ]] && ln $ln_args "$dest" "$LATEST_FULL"
+    fi
+
+    echo "Syncing filesystem..."
+    sync -f .
+    echo "Done syncing filesystem."
+
+    local src_name="$(basename "$dest")"
+    local name="$src_name"
+
+    # Account for duplicates
+    local counter=0
+    while [[ -a "$name" ]]; do
+        name="$src_name.$counter"
+        counter=$((counter + 1))
+    done
+
+    # TODO: batch sql queries
+
+    local size=0
+
+    local sub_size_prev=0
+    local size_next=0
+
+
+    if [[ $compress -eq 1 ]]; then
+        size=$(stat --format='%s' "$dest")
+    else
+        pushd "$dest" >/dev/null
+        local -a listing
+        readarray -t listing < <(find * ! -type d -printf '%s\n%n\n')
+        # We know that earlier we would have hard failed if there wasn't already
+        # a previous backup to go off of, if this is incremental/differential - so...
+        # local script=""
+        echo "Analyzing transfer..."
+        local length=${#listing[@]}
+        length=$((length - 1))
+        for i in $(seq 0 2 $length); do
+            # local old="$previous/$e"
+            # local inode=$(stat --format='%i' "$e")
+            local file_size="${listing[$((i + 0))]}"
+            local links="${listing[$((i + 1))]}"
+            # local file_size=$(stat --format='%s' "$e")
+            size_next=$((size_next + file_size))
+            # You know, I used to use rsync for this, but for some reason I
+            # didn't consider that the inodes would be different between the
+            # backups if rsync is willing to do a transfer.
+            # also solves t he problem of needing to carry over aguments.
+
+            # Oh, funny thing:
+            # -a tests for existance of the *file that the symlink points to*,
+            # not the symlink itself!
+            # ^ This was only relevant for the previous version
+
+            # If we have more than one link on this file, then we know it MUST
+            # have linked to someone - and the only place it could have linked
+            # to is a file with the exact same path in the previous backup.
+            # Assert ("$action" == "full") != ($links -ge 2)
+            if [[ $links -ge 2 ]]; then
+                # steal inode
+                # "$SQL" "$db" "update inodes set directory='$name' where inode=$inode;";
+                # script="$script update inodes set directory='$name' where inode=$inode;";
+                sub_size_prev=$((sub_size_prev + file_size))
+            else
+                # create inode
+                # "$SQL" "$db" "insert into inodes values ($inode, '$name');"
+                # script="$script insert into inodes values ($inode, '$name');"
+                size=$((size + file_size))
+            fi
+        done
+        echo "Done analyzing transfer."
+        # exit 1
+        # echo "executing: $script"
+        # "$SQL" "$db" <<<"$script"
+        # echo "done..."
+        popd >/dev/null
+    fi
+
+    echo "Writing metadata..."
+    local script=""
+    if [[ $sub_size_prev -ne 0 ]]; then
+        # Update size based on inodes stolen
+        script="$script update items set size=size-$sub_size_prev where basename='$(basename "$previous")';"
+    fi
+    # Create dir entry
+    script="$script insert into items values ('$name', $size_next, $EPOCHSECONDS);"
+    # Update total size
+    script="$script update int_prop set value=value+$size where key='size';"
+
+    "$SQL" "$db" "$script"
+
+    echo "Done writing metadata."
+
+    # If we have gotten this far, we have encountered no errors; commit our
+    # changes.
+
+    echo "Committing changes..."
+
+    mv "$dest" "$name"
+    mv "$db" "$real_db"
+
+    if [[ $compress -eq 0 ]]; then
+        local ln_args=-svfT
+        ln $ln_args "$name" "$LATEST"
+        [[ $action == full ]] && ln $ln_args "$name" "$LATEST_FULL"
+    fi
+
+    rm -rf "$staging"
+
+    sync -f .
+
+    echo "Done committing changes."
+}
+
+cmd_restore() {
+    [[ $# -ne 2 ]] && die "Expected exactly two arguments"
+    local src="$(readlink -f "$1")"
+    local dest="$(readlink -f "$2")" # Unnecessary
+    local latest="$(readlink -f "$src/$LATEST")"
+
+    [[ ! -d "$src" ]] && die "$src is not a directory that exists"
+    [[ ! -d "$dest" ]] && die "$src is not a directory that exists"
+    [[ ! -d "$latest" ]] && die "There do not appear to be any valid backups at $src"
+
+    command -v "nnn" >/dev/null || die "Backend 'nnn' not installed."
+
+    local backend=(nnn -p -)
+
+    local listing
+    readarray -t listing < <("${backend[@]}" "$latest")
+
+    [[ ${#listing[@]} -eq 0 ]] && die "No files were selected."
+
+    echo "Continuing will rsync the following to '$dest'":
+    echo "${listing[@]}"
+
+    printf "Continue? [y/N]"
+    local response
+    read -r response
+    if [[ "$response" =~ ^[yY] ]]; then
+        cd "$dest"
+        for file in "${listing[@]}"; do
+            local target="$file"
+            target="$(dirname "$target")"
+            target="${target#$latest/}"
+            target="$(readlink -f "./$target")"
+            mkdir -p "$target"
+            rsync --archive --verbose "$file" "$target"
+        done
+    fi
+}
+
+# Umounts the target directory. If it is a crypt container, additionally closes
+# it.
+# 1 -> the directory to unmount
+cmd_umount() {
+    [[ $# -ne 1 ]] && die "Expected exactly one argument"
+
+    local target="$(readlink -f "$1")"
+    local src="$(mount | grep -m 1 -oP "^[^ ]+(?= on $target)")"
+    
+    sudo umount "$target"
+
+    src="$(basename "$src")"
+    readarray -t devices < <(find /sys/class/block -name 'dm-*' -exec cat {}/dm/name \;)
+    for block in "${devices[@]}"; do
+        if [[ "$block" == "$src" ]]; then
+            sudo cryptsetup close "$src"
+            break
+        fi
+    done
+}
+
+# Mounts the target disk at the given location. If it is a crypt container, will
+# try to unlock it.
+# cmd_mount [options] <source> <mountpoint>
+# -k|--key      The key to use for decryption (also includes --crypt)
+# -c|--crypt    Force decryption instead of relying on autodetection
+# --ro          Mount read only
+cmd_mount() {
+    local crypt=0
+    local key=
+    local ro=
+    local from=
+    local to=
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -k|--key) shift; key="$1"; crypt=1;;
+            -c|--crypt) crypt=1;;
+            --ro) ro=1;;
+            *)
+                [[ $# -ne 2 ]] && die "Invalid number of positional arguments"
+                from="$1"
+                to="$2"
+                shift
+                ;;
+        esac
+        shift
+    done
+
+    [[ ! -d "$to" ]] && die "Mountpoint is not a regular directory"
+    [[ ! ( -b "$from" || -f "$from" ) ]] && die "Source is not a file or block device (or is inaccessable)"
+
+    # For purposes of cleanup
+    local crypt_id=
+
+    if [[ $crypt -eq 1 ]] || sudo cryptsetup isLuks "$from"; then
+        local args=()
+        [[ -n "$key" ]] && args+=(--key-file "$key")
+        crypt_id="$(basename "$from")_$((RANDOM % 99999))"
+        sudo cryptsetup open "${args[@]}" "$from" "$crypt_id"
+        from="/dev/mapper/$crypt_id"
+    fi
+
+    local args=()
+    [[ $ro -eq 1 ]] && args+=(-o ro)
+
+    if ! sudo mount "${args[@]}" "$from" "$to"; then
+        error "Mount failed, cleaning up..."
+        if [[ -n "$crypt_id" ]]; then
+            sudo cryptsetup close "$crypt_id"
+        fi
+        die
+    fi
+
+}
+
+cmd_size() {
+    [[ $# -ne 1 ]] && die "Expected exactly one argument"
+
+    local target="$1"
+
+    cd "$target"
+
+    local db="$DB"
+
+    [[ ! -f "$db" ]] && die "No DB"
+
+    local size=$("$SQL" "$db" "select value from int_prop where key='size';")
+
+    echo "$size"
+}
+
+declare verb=""
+while [[ $# -gt 0 && -z "$verb" ]]; do
+    case "$1" in
+        -v|--verbose) VERBOSE=1;;
+        -d|--dry-run) DRY_RUN=1;;
+        *) verb="$1";;
+    esac
+    shift
+done
+
+[[ -z "$verb" ]] && die "Expected a verb"
+
+case "$verb" in
+    prune) cmd_prune "$@";;
+    run) cmd_run "$@";;
+    restore) cmd_restore "$@";;
+    mount) cmd_mount "$@";;
+    umount) cmd_umount "$@";;
+    size) cmd_size "$@";;
+    *) die "Unknown verb '$verb'";;
+esac
+
+
+# Subcommands:
+# - prune
+# - run (backup)
+#     - config
+#     - rule
+#     - 
+# - restore
+# - mount (a disk from the rules, in case you want to inspect your data or smthn)
+# - info
+#    - disk usage
+#    - the directories present
+#    - the dates that we have for backups
+#    - space remaining for these disks
+
+
